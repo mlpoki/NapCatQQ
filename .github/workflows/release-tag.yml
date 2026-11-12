@@ -10,6 +10,7 @@ permissions: write-all
 
 jobs:
   validate-version:
+    if: github.repository == 'NapNeko/NapCatQQ'
     runs-on: ubuntu-latest
     outputs:
       valid: ${{ steps.check.outputs.valid }}
