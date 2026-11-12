@@ -85,7 +85,7 @@ test('concurrent creation rechecks commit; existing unrelated body/assets surviv
       f.github.paginate = async () => [{ name: 'unrelated.txt', id: 7 }];
       f.github.rest.repos.deleteReleaseAsset = async () => assert.fail('Must preserve unrelated asset');
       f.github.rest.repos.uploadReleaseAsset = async args => { assert.ok(assets.includes(args.name)); count++; };
-      if (conflictSha === sha) { await publish(f); assert.equal(count, 5); }
+      if (conflictSha === sha) { await publish(f); assert.equal(count, 4); }
       else { await assert.rejects(publish(f), /expected main snapshot/); assert.equal(count, 0); }
     }
   } finally {
@@ -98,5 +98,8 @@ test('every build/publish checkout uses resolver SHA and required jobs gate publ
   assert.equal((yaml.match(/ref: \$\{\{ needs.resolve-main.outputs.source_sha \}\}/g) || []).length, 3);
   assert.match(yaml, /needs: \[resolve-main, preflight, build\]/);
   assert.match(yaml, /fail-fast: false/);
+  assert.doesNotMatch(yaml, /macos-15|platform: macOS-arm64/);
+  assert.equal(assets.length, 4);
+  assert.ok(assets.every(name => !name.includes('macOS')));
   assert.doesNotMatch(yaml, /secrets\.(NAPCAT_BUILD|APIFOX_TOKEN)|workflow_call|repository_dispatch/);
 });
