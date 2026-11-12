@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -23,7 +24,18 @@ def require(root, *names):
             raise RuntimeError(f'Missing/empty: {file}')
 
 
-def native(root):
+def pe_x64(file):
+    with open(file, 'rb') as stream:
+        if stream.read(2) != b'MZ':
+            raise RuntimeError(f'Not PE: {file}')
+        stream.seek(0x3c)
+        offset = struct.unpack('<I', stream.read(4))[0]
+        stream.seek(offset)
+        if stream.read(4) != b'PE\0\0' or struct.unpack('<H', stream.read(2))[0] != 0x8664:
+            raise RuntimeError(f'Not Windows x64: {file}')
+
+
+def native(root, node='node'):
     system = platform.system()
     suffix = {'Windows': 'win32.x64', 'Linux': 'linux.x64', 'Darwin': 'darwin.arm64'}[system]
     addons = [root / 'native' / folder / name for folder, name in [
@@ -33,6 +45,8 @@ def native(root):
     ]]
     for file in addons:
         require(file.parent, file.name)
+        if system == 'Windows':
+            pe_x64(file)
         if system != 'Windows':
             run('file', str(file))
         if system == 'Darwin':
@@ -41,7 +55,7 @@ def native(root):
                 raise RuntimeError(f'Not arm64: {file}: {arch}')
             run('codesign', '--force', '--sign', '-', str(file))
         # Each addon is tested in its own process: a crash must fail the job.
-        run('node', '-e', 'require(process.argv[1]); console.log("native-load PASS"); process.exit(0)', str(file))
+        run(node, '-e', 'require(process.argv[1]); console.log("native-load PASS"); process.exit(0)', str(file))
 
 
 def smoke(root):
@@ -56,6 +70,9 @@ def smoke(root):
     if provenance['SOURCE_SHA'] != os.environ['SOURCE_SHA']:
         raise RuntimeError('Wrong source snapshot')
     server = root / ('qce-server.exe' if windows else 'qce-server')
+    if windows:
+        for file in [server, root / 'native/packet/MoeHoo.win32.x64.node']:
+            pe_x64(file)
     if platform.system() == 'Darwin':
         run('file', str(server))
         run('lipo', '-verify_arch', 'arm64', str(server))
@@ -75,6 +92,10 @@ def smoke(root):
     else:
         require(root, 'qce-standalone.mjs', 'launcher-user.bat' if windows else 'launcher-user.sh')
         run('node', '--check', str(root / 'qce-standalone.mjs'))
+        if not windows:
+            require(root, 'napcat-bootstrap.mjs')
+            run('bash', '-n', str(root / 'launcher-user.sh'))
+            run('node', '--check', str(root / 'napcat-bootstrap.mjs'))
         command = ['node', 'qce-standalone.mjs', '40653']
     env = dict(os.environ, QCE_STANDALONE_MODE='1', QCE_NO_AUTO_OPEN='1', QCE_SERVER_PORT='40653')
     # Standalone prints an ephemeral local access token; never copy its logs to CI output.
@@ -113,7 +134,9 @@ def main():
             require(dest, 'node.exe', 'wrapper.node', 'QQNT.dll', 'index.js', 'napcat.bat', 'napcat/napcat.mjs', 'napcat/static/index.html', 'napcat/plugins/napcat-plugin-builtin/index.mjs')
             run(str(dest / 'node.exe'), '--check', str(dest / 'index.js'))
             run(str(dest / 'node.exe'), '-e', 'if (!require("./wrapper.node").NodeQQNTWrapperUtil) throw Error("wrapper ABI mismatch"); console.log("QQ wrapper native-load PASS"); process.exit(0)', cwd=dest)
-            native(dest / 'napcat')
+            for file in ['node.exe', 'wrapper.node', 'QQNT.dll']:
+                pe_x64(dest / file)
+            native(dest / 'napcat', str(dest / 'node.exe'))
         else:
             root = dest / dest.name
             require(root, 'napcat.mjs', 'static/index.html')

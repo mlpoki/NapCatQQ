@@ -54,6 +54,7 @@ def package(kind):
         end = text.index('    # Replace upstream napiLoader', start)
         text = text[:start] + f'    shutil.copytree({str(source)!r}, output_dir)\n\n' + text[end:]
         text = text.replace('output_zip = f"NapCat-Framework-QCE-v{qce_version}.zip"', 'output_zip = "NapCat-Framework-QCE.zip"')
+        text = text.replace('    os.remove("NapCat.Framework.zip")', '    # No downloaded Framework archive to clean up.')
     # Preserve embedded launcher line endings; keep the adapted script beside its helpers.
     adapted = script.with_name('fork-' + name)
     adapted.write_bytes(text.replace('\n', '\r\n').encode('utf-8'))
