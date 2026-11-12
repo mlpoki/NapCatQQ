@@ -1,0 +1,903 @@
+import { RequestUtil } from 'napcat-common/src/request';
+import {
+  GroupEssenceMsgRet,
+  InstanceContext,
+  WebApiGroupMember,
+  WebApiGroupMemberRet,
+  WebApiGroupNoticeRet,
+  WebHonorType, NapCatCore,
+} from '@/napcat-core/index';
+
+import { createReadStream, existsSync, statSync } from 'node:fs';
+import { open, unlink, writeFile, type FileHandle } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { basename, join } from 'node:path';
+import { qunAlbumControl, qunAlbumVideoControl, qunAlbumVideoCoverControl, QunAlbumBatch, nextQunAlbumBatchId } from '../data/webapi';
+import { createAlbumCommentRequest, createAlbumFeedPublish, createAlbumMediaFeed } from '../data/album';
+import { FFmpegService } from '../helper/ffmpeg/ffmpeg';
+import { defaultVideoThumbB64 } from '../helper/ffmpeg/video';
+import {
+  buildQzoneDeleteBody,
+  buildQzonePublishBody,
+  buildQzoneUploadImageBody,
+  parseQzoneDeleteResponse,
+  parseQzonePublishResponse,
+  parseQzoneUploadImageResponseText,
+  toQzoneRichval,
+  QzoneDeleteResponse,
+  QzonePublishResponse,
+} from '../data/qzone';
+export interface SetNoticeRetSuccess {
+  ec: number;
+  em: string;
+  id: number;
+  ltsm: number;
+  new_fid: string;
+  read_only: number;
+  role: number;
+  srv_code: number;
+}
+
+// 群相册分片上传的并发数
+const QUN_ALBUM_SLICE_CONCURRENCY = 8;
+// 服务端没给分片大小时的下限，以及防止异常值的上限
+const QUN_ALBUM_SLICE_MIN = 16384;
+const QUN_ALBUM_SLICE_MAX = 4 * 1024 * 1024;
+
+// 流式计算文件摘要，避免为了算 MD5/SHA1 把整个文件读进内存（视频可能有几十上百 MB）
+function hashFile (path: string, algorithm: 'md5' | 'sha1'): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash(algorithm);
+    createReadStream(path)
+      .on('data', chunk => hash.update(chunk))
+      .on('end', () => resolve(hash.digest('hex')))
+      .on('error', reject);
+  });
+}
+
+// 按需读取单个分片：并发上传时的内存占用只有「并发数 × 分片大小」
+async function readSlice (handle: FileHandle, offset: number, length: number): Promise<Buffer> {
+  const buffer = Buffer.alloc(length);
+  const { bytesRead } = await handle.read(buffer, 0, length, offset);
+  // 读不满说明文件在上传过程中被改短了，继续传只会传上去一段补零的数据
+  if (bytesRead !== length) {
+    throw new Error(`读取分片失败: offset=${offset} 预期 ${length} 字节，实际 ${bytesRead} 字节`);
+  }
+  return buffer;
+}
+
+export class NTQQWebApi {
+  context: InstanceContext;
+  core: NapCatCore;
+
+  constructor (context: InstanceContext, core: NapCatCore) {
+    this.context = context;
+    this.core = core;
+  }
+
+  async shareDigest (groupCode: string, msgSeq: string, msgRandom: string, targetGroupCode: string) {
+    const cookieObject = await this.core.apis.UserApi.getCookies('qun.qq.com');
+    const url = `https://qun.qq.com/cgi-bin/group_digest/share_digest?${new URLSearchParams({
+      bkn: this.getBknFromCookie(cookieObject),
+      group_code: groupCode,
+      msg_seq: msgSeq,
+      msg_random: msgRandom,
+      target_group_code: targetGroupCode,
+    }).toString()}`;
+    try {
+      return RequestUtil.HttpGetText(url, 'GET', '', { Cookie: this.cookieToString(cookieObject) });
+    } catch {
+      return undefined;
+    }
+  }
+
+  async getGroupEssenceMsgAll (GroupCode: string) {
+    const ret: GroupEssenceMsgRet[] = [];
+    for (let i = 0; i < 20; i++) {
+      const data = await this.getGroupEssenceMsg(GroupCode, i, 50);
+      if (!data) break;
+      ret.push(data);
+      if (data.data.is_end) break;
+    }
+    return ret;
+  }
+
+  async getGroupEssenceMsg (GroupCode: string, page_start: number = 0, page_limit: number = 50) {
+    const cookieObject = await this.core.apis.UserApi.getCookies('qun.qq.com');
+    const url = `https://qun.qq.com/cgi-bin/group_digest/digest_list?${new URLSearchParams({
+      bkn: this.getBknFromCookie(cookieObject),
+      page_start: page_start.toString(),
+      page_limit: page_limit.toString(),
+      group_code: GroupCode,
+    }).toString()}`;
+    try {
+      const ret = await RequestUtil.HttpGetJson<GroupEssenceMsgRet>(
+        url,
+        'GET',
+        '',
+        { Cookie: this.cookieToString(cookieObject) }
+      );
+      return ret.retcode === 0 ? ret : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async getGroupMembers (GroupCode: string): Promise<WebApiGroupMember[]> {
+    // logDebug('webapi 获取群成员', GroupCode);
+    const memberData: Array<WebApiGroupMember> = new Array<WebApiGroupMember>();
+    const cookieObject = await this.core.apis.UserApi.getCookies('qun.qq.com');
+    const retList: Promise<WebApiGroupMemberRet>[] = [];
+    const fastRet = await RequestUtil.HttpGetJson<WebApiGroupMemberRet>(
+      `https://qun.qq.com/cgi-bin/qun_mgr/search_group_members?${new URLSearchParams({
+        st: '0',
+        end: '40',
+        sort: '1',
+        gc: GroupCode,
+        bkn: this.getBknFromCookie(cookieObject),
+      }).toString()}`,
+      'POST',
+      '',
+      { Cookie: this.cookieToString(cookieObject) }
+    );
+    if (!fastRet?.count || fastRet?.errcode !== 0 || !fastRet?.mems) {
+      return [];
+    } else {
+      for (const key in fastRet.mems) {
+        if (fastRet.mems[key]) {
+          memberData.push(fastRet.mems[key]);
+        }
+      }
+    }
+    // 初始化获取PageNum
+    const PageNum = Math.ceil(fastRet.count / 40);
+    // 遍历批量请求
+    for (let i = 2; i <= PageNum; i++) {
+      const ret = RequestUtil.HttpGetJson<WebApiGroupMemberRet>(
+        `https://qun.qq.com/cgi-bin/qun_mgr/search_group_members?${new URLSearchParams({
+          st: ((i - 1) * 40).toString(),
+          end: (i * 40).toString(),
+          sort: '1',
+          gc: GroupCode,
+          bkn: this.getBknFromCookie(cookieObject),
+        }).toString()}`,
+        'POST',
+        '',
+        { Cookie: this.cookieToString(cookieObject) }
+      );
+      retList.push(ret);
+    }
+    // 批量等待
+    for (let i = 1; i <= PageNum; i++) {
+      const ret = await (retList[i]);
+      if (!ret?.count || ret?.errcode !== 0 || !ret?.mems) {
+        continue;
+      }
+      for (const key in ret.mems) {
+        if (ret.mems[key]) {
+          memberData.push(ret.mems[key]);
+        }
+      }
+    }
+    return memberData;
+  }
+
+  // public  async addGroupDigest(groupCode: string, msgSeq: string) {
+  //   const url = `https://qun.qq.com/cgi-bin/group_digest/cancel_digest?random=665&X-CROSS-ORIGIN=fetch&group_code=${groupCode}&msg_seq=${msgSeq}&msg_random=444021292`;
+  //   const res = await this.request(url);
+  //   return await res.json();
+  // }
+
+  // public async getGroupDigest(groupCode: string) {
+  //   const url = `https://qun.qq.com/cgi-bin/group_digest/digest_list?random=665&X-CROSS-ORIGIN=fetch&group_code=${groupCode}&page_start=0&page_limit=20`;
+  //   const res = await this.request(url);
+  //   return await res.json();
+  // }
+
+  async setGroupNotice (
+    GroupCode: string,
+    Content: string,
+    pinned: number = 0,
+    type: number = 1,
+    is_show_edit_card: number = 1,
+    tip_window_type: number = 1,
+    confirm_required: number = 1,
+    picId: string = '',
+    imgWidth: number = 540,
+    imgHeight: number = 300
+  ) {
+    const cookieObject = await this.core.apis.UserApi.getCookies('qun.qq.com');
+
+    try {
+      const settings = JSON.stringify({
+        is_show_edit_card,
+        tip_window_type,
+        confirm_required,
+      });
+      const externalParam = {
+        pic: picId,
+        imgWidth: imgWidth.toString(),
+        imgHeight: imgHeight.toString(),
+      };
+      const ret: SetNoticeRetSuccess = await RequestUtil.HttpGetJson<SetNoticeRetSuccess>(
+        `https://web.qun.qq.com/cgi-bin/announce/add_qun_notice?${new URLSearchParams({
+          bkn: this.getBknFromCookie(cookieObject),
+          qid: GroupCode,
+          text: Content,
+          pinned: pinned.toString(),
+          type: type.toString(),
+          settings,
+          ...(picId === '' ? {} : externalParam),
+        }).toString()}`,
+        'POST',
+        '',
+        { Cookie: this.cookieToString(cookieObject) }
+      );
+      return ret;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async getGroupNotice (GroupCode: string): Promise<undefined | WebApiGroupNoticeRet> {
+    const cookieObject = await this.core.apis.UserApi.getCookies('qun.qq.com');
+    try {
+      const ret = await RequestUtil.HttpGetJson<WebApiGroupNoticeRet>(
+        `https://web.qun.qq.com/cgi-bin/announce/get_t_list?${new URLSearchParams({
+          bkn: this.getBknFromCookie(cookieObject),
+          qid: GroupCode,
+          ft: '23',
+          ni: '1',
+          n: '1',
+          i: '1',
+          log_read: '1',
+          platform: '1',
+          s: '-1',
+        }).toString()}&n=20`,
+        'GET',
+        '',
+        { Cookie: this.cookieToString(cookieObject) }
+      );
+      return ret?.ec === 0 ? ret : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getDataInternal (cookieObject: { [key: string]: string; }, groupCode: string, type: number) {
+    let resJson;
+    try {
+      const res = await RequestUtil.HttpGetText(
+        `https://qun.qq.com/interactive/honorlist?${new URLSearchParams({
+          gc: groupCode,
+          type: type.toString(),
+        }).toString()}`,
+        'GET',
+        '',
+        { Cookie: this.cookieToString(cookieObject) }
+      );
+      const match = /window\.__INITIAL_STATE__=(.*?);/.exec(res);
+      if (match?.[1]) {
+        resJson = JSON.parse(match[1].trim());
+      }
+      return type === 1 ? resJson?.talkativeList : resJson?.actorList;
+    } catch (e) {
+      this.context.logger.logDebug('获取当前群荣耀失败', e);
+      return undefined;
+    }
+  }
+
+  private async getHonorList (cookieObject: { [key: string]: string; }, groupCode: string, type: number) {
+    const data = await this.getDataInternal(cookieObject, groupCode, type);
+    if (!data) {
+      this.context.logger.logError(`获取类型 ${type} 的荣誉信息失败`);
+      return [];
+    }
+    return data.map((item: {
+      uin: string,
+      name: string,
+      avatar: string,
+      desc: string,
+    }) => ({
+      user_id: item?.uin,
+      nickname: item?.name,
+      avatar: item?.avatar,
+      description: item?.desc,
+    }));
+  }
+
+  async getGroupHonorInfo (groupCode: string, getType: WebHonorType) {
+    const cookieObject = await this.core.apis.UserApi.getCookies('qun.qq.com');
+    const HonorInfo = {
+      group_id: Number(groupCode),
+      current_talkative: {},
+      talkative_list: [],
+      performer_list: [],
+      legend_list: [],
+      emotion_list: [],
+      strong_newbie_list: [],
+    };
+
+    if (getType === WebHonorType.TALKATIVE || getType === WebHonorType.ALL) {
+      const talkativeList = await this.getHonorList(cookieObject, groupCode, 1);
+      if (talkativeList.length > 0) {
+        HonorInfo.current_talkative = talkativeList[0];
+        HonorInfo.talkative_list = talkativeList;
+      }
+    }
+
+    if (getType === WebHonorType.PERFORMER || getType === WebHonorType.ALL) {
+      HonorInfo.performer_list = await this.getHonorList(cookieObject, groupCode, 2);
+    }
+
+    if (getType === WebHonorType.LEGEND || getType === WebHonorType.ALL) {
+      HonorInfo.legend_list = await this.getHonorList(cookieObject, groupCode, 3);
+    }
+
+    if (getType === WebHonorType.EMOTION || getType === WebHonorType.ALL) {
+      HonorInfo.emotion_list = await this.getHonorList(cookieObject, groupCode, 6);
+    }
+
+    // 冒尖小春笋好像已经被tx扬了 R.I.P.
+    if (getType === WebHonorType.EMOTION || getType === WebHonorType.ALL) {
+      HonorInfo.strong_newbie_list = [];
+    }
+
+    return HonorInfo;
+  }
+
+  private cookieToString (cookieObject: { [key: string]: string; }) {
+    return Object.entries(cookieObject).map(([key, value]) => `${key}=${value}`).join('; ');
+  }
+
+  public getBknFromCookie (cookieObject: { [key: string]: string; }) {
+    const sKey = cookieObject['skey'] as string;
+
+    let hash = 5381;
+    for (let i = 0; i < sKey.length; i++) {
+      const code = sKey.charCodeAt(i);
+      hash = hash + (hash << 5) + code;
+    }
+    return (hash & 0x7FFFFFFF).toString();
+  }
+
+  public getBknFromSKey (sKey: string) {
+    let hash = 5381;
+    for (let i = 0; i < sKey.length; i++) {
+      const code = sKey.charCodeAt(i);
+      hash = hash + (hash << 5) + code;
+    }
+    return (hash & 0x7FFFFFFF).toString();
+  }
+
+  public getBknFromPSKey (psKey: string) {
+    return this.getBknFromSKey(psKey);
+  }
+
+  async getAlbumListByNTQQ (gc: string, attach_info: string = '') {
+    return await this.context.session.getAlbumService().getAlbumList({
+      qun_id: gc,
+      attach_info,
+      seq: 3331,
+      request_time_line: {
+        request_invoke_time: '0',
+      },
+    });
+  }
+
+  async getAlbumList (gc: string) {
+    const skey = await this.core.apis.UserApi.getSKey() || '';
+    const pskey = (await this.core.apis.UserApi.getPSkey(['qzone.qq.com'])).domainPskeyMap.get('qzone.qq.com') || '';
+    const bkn = this.getBknFromSKey(skey);
+    const uin = this.core.selfInfo.uin || '10001';
+    const cookies = `p_uin=o${this.core.selfInfo.uin}; p_skey=${pskey}; skey=${skey}; uin=o${uin} `;
+    const api = 'https://h5.qzone.qq.com/proxy/domain/u.photo.qzone.qq.com/cgi-bin/upp/qun_list_album_v2?';
+    const params = new URLSearchParams({
+      random: '7570',
+      g_tk: bkn,
+      format: 'json',
+      inCharset: 'utf-8',
+      outCharset: 'utf-8',
+      qua: 'V1_IPH_SQ_6.2.0_0_HDBM_T',
+      cmd: 'qunGetAlbumList',
+      qunId: gc,
+      qunid: gc,
+      start: '0',
+      num: '1000',
+      uin,
+      getMemberRole: '0',
+    });
+    const response = await RequestUtil.HttpGetJson<{ data: { album: Array<{ id: string, title: string; }>; }; }>(api + params.toString(), 'GET', '', {
+      Cookie: cookies,
+    });
+    return response.data.album;
+  }
+
+  async createQunAlbumSession (
+    gc: string, sAlbumID: string, sAlbumName: string, path: string,
+    skey: string, pskey: string, img_md5: string, uin: string, batch?: QunAlbumBatch
+  ) {
+    const img_size = statSync(path).size;
+    const img_name = basename(path);
+    const GTK = this.getBknFromSKey(skey);
+    const cookie = `p_uin=o${uin}; p_skey=${pskey}; skey=${skey}; uin=o${uin}`;
+    const body = qunAlbumControl({
+      uin,
+      group_id: gc,
+      pskey,
+      pic_md5: img_md5,
+      img_size,
+      img_name,
+      sAlbumName,
+      sAlbumID,
+      // 同批多图共用 batchId，并按「第几张 / 共几张」上报，相册里才会合并成同一条
+      batchId: batch?.batchId,
+      batchIndex: batch?.index,
+      photo_num: batch?.count,
+      batch_num: batch?.count,
+    });
+    const api = `https://h5.qzone.qq.com/webapp/json/sliceUpload/FileBatchControl/${img_md5}?g_tk=${GTK}`;
+    const post = await RequestUtil.HttpGetJson<{
+      data: { session: string; slice_size?: number | string; },
+      ret: number,
+      msg: string;
+    }>(api, 'POST', body, {
+      Cookie: cookie,
+      'Content-Type': 'application/json',
+    });
+    return post;
+  }
+
+  // 服务端会在会话响应里给出建议的分片大小；取不到或异常时退回 16384。
+  private resolveQunAlbumSliceSize (raw: unknown) {
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < QUN_ALBUM_SLICE_MIN) return QUN_ALBUM_SLICE_MIN;
+    return Math.min(value, QUN_ALBUM_SLICE_MAX);
+  }
+
+  async uploadQunAlbumSlice (
+    path: string, session: string, skey: string, pskey: string, uin: string, slice_size: number,
+    options: { appid?: string, cmd?: string; } = {}
+  ) {
+    const appid = options.appid ?? 'qun';
+    const cmd = options.cmd ?? 'FileUpload';
+    const img_size = statSync(path).size;
+    const GTK = this.getBknFromSKey(skey);
+    const cookie = `p_uin=o${uin}; p_skey=${pskey}; skey=${skey}; uin=o${uin}`;
+
+    // 只记分片位置，不预先读内容；再并发上传（串行上传在几 MB 的图上要几十秒）
+    const slices: { seq: number, offset: number, end: number; }[] = [];
+    let seq = 0;
+    let offset = 0;
+    while (offset < img_size) {
+      const end = Math.min(offset + slice_size, img_size);
+      slices.push({ seq, offset, end });
+      offset = end;
+      seq++;
+    }
+
+    // 视频分片响应里会带 sVid，封面二段上传要靠它把封面挂到视频上
+    let sVid: string | undefined;
+
+    const handle = await open(path, 'r');
+    const uploadSlice = async (slice: { seq: number, offset: number, end: number; }) => {
+      const chunk = await readSlice(handle, slice.offset, slice.end - slice.offset);
+      const form = new FormData();
+      form.append('uin', uin);
+      form.append('appid', appid);
+      form.append('session', session);
+      form.append('offset', slice.offset.toString());
+      form.append('data', new Blob([chunk], { type: 'application/octet-stream' }), 'blob');
+      form.append('checksum', '');
+      form.append('check_type', '0');
+      form.append('retry', '0');
+      form.append('seq', slice.seq.toString());
+      form.append('end', slice.end.toString());
+      form.append('cmd', cmd);
+      form.append('slice_size', slice_size.toString());
+      form.append('biz_req.iUploadType', '0');
+
+      // 分片路径必须与 cmd 一致：视频走 /sliceUpload/FileUploadVideo，
+      // 否则服务端按图片处理，分片会「成功」但响应里没有 sVid
+      const api = `https://h5.qzone.qq.com/webapp/json/sliceUpload/${cmd}?seq=${slice.seq}&retry=0&offset=${slice.offset}&end=${slice.end}&total=${img_size}&type=form&g_tk=${GTK}`;
+      const response = await fetch(api, {
+        method: 'POST',
+        headers: {
+          Cookie: cookie,
+        },
+        body: form,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const post = await response.json() as { ret: number, msg: string, data?: { biz?: { sVid?: string; }; }; };
+      if (post.ret !== 0) {
+        throw new Error(`分片 ${slice.seq} 上传失败: ${post.msg}`);
+      }
+      if (!sVid && typeof post.data?.biz?.sVid === 'string' && post.data.biz.sVid) {
+        sVid = post.data.biz.sVid;
+      }
+    };
+
+    try {
+      // 最后一片要等前面的全部传完再发：服务端收到最后一片就认为文件传完了，
+      // 并发时它可能比前面的分片先到
+      const lastSlice = slices.pop();
+      let next = 0;
+      let failure: { error: unknown; } | undefined;
+      // 固定数量的 worker 各自领下一片，慢的分片不会拖住整批
+      const worker = async () => {
+        while (!failure) {
+          const slice = slices[next++];
+          if (!slice) break;
+          try {
+            await uploadSlice(slice);
+          } catch (error) {
+            if (!failure) failure = { error };
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(QUN_ALBUM_SLICE_CONCURRENCY, slices.length) }, worker));
+      if (failure) throw failure.error;
+      if (lastSlice) await uploadSlice(lastSlice);
+    } finally {
+      await handle.close();
+    }
+
+    return { success: true, message: '上传完成', sVid };
+  }
+
+  // 多张图片一次上传：共用同一个 batchId，相册里显示为同一条
+  async uploadImagesToQunAlbum (gc: string, sAlbumID: string, sAlbumName: string, paths: string[]) {
+    if (!paths.length) throw new Error('上传列表为空');
+    const skey = await this.core.apis.UserApi.getSKey() || '';
+    const pskey = (await this.core.apis.UserApi.getPSkey(['qzone.qq.com'])).domainPskeyMap.get('qzone.qq.com') || '';
+    const uin = this.core.selfInfo.uin || '10001';
+    const batchId = nextQunAlbumBatchId();
+    const count = paths.length.toString();
+
+    for (const [index, path] of paths.entries()) {
+      const img_md5 = await hashFile(path, 'md5');
+      const post = await this.createQunAlbumSession(
+        gc, sAlbumID, sAlbumName, path, skey, pskey, img_md5, uin,
+        { batchId, count, index: index.toString() }
+      );
+      if (!post.data?.session) throw new Error(`创建群相册会话失败: ${post.msg || post.ret}`);
+      await this.uploadQunAlbumSlice(path, post.data.session, skey, pskey, uin, this.resolveQunAlbumSliceSize(post.data.slice_size));
+    }
+  }
+
+  async uploadImageToQunAlbum (gc: string, sAlbumID: string, sAlbumName: string, path: string) {
+    await this.uploadImagesToQunAlbum(gc, sAlbumID, sAlbumName, [path]);
+  }
+
+  /**
+   * 上传视频到群相册。
+   *
+   * 分三步：
+   * 1. 建视频会话：appid=video_qun / cmd=FileUploadVideo / SHA1 校验，此时不带相册
+   * 2. 分片上传视频，从分片响应里拿 sVid
+   * 3. 按图片上传封面并用 vid 关联视频，相册和批次号在这一步带上，视频随封面进相册
+   */
+  async uploadVideoToQunAlbum (gc: string, sAlbumID: string, sAlbumName: string, path: string) {
+    const skey = await this.core.apis.UserApi.getSKey() || '';
+    const pskey = (await this.core.apis.UserApi.getPSkey(['qzone.qq.com'])).domainPskeyMap.get('qzone.qq.com') || '';
+    const uin = this.core.selfInfo.uin || '10001';
+    const GTK = this.getBknFromSKey(skey);
+    const cookie = `p_uin=o${uin}; p_skey=${pskey}; skey=${skey}; uin=o${uin}`;
+    const video_sha1 = await hashFile(path, 'sha1');
+
+    // 时长：ffmpeg 不可用时上报 0
+    let playTime = 0;
+    try {
+      playTime = Math.max(0, Math.round(await FFmpegService.getDuration(path)));
+    } catch (e) {
+      this.context.logger.logWarn('获取视频时长失败，iPlayTime 上报 0', e);
+    }
+
+    // 1) 视频主体（不带相册，只传成素材）
+    const videoSession = await RequestUtil.HttpGetJson<{
+      data: { session: string; slice_size?: number | string; },
+      ret: number,
+      msg: string;
+    }>(`https://h5.qzone.qq.com/webapp/json/sliceUpload/FileBatchControl/${video_sha1}?g_tk=${GTK}`, 'POST', qunAlbumVideoControl({
+      uin,
+      group_id: gc,
+      pskey,
+      video_sha1,
+      video_size: statSync(path).size,
+      play_time: playTime,
+    }), {
+      Cookie: cookie,
+      'Content-Type': 'application/json',
+    });
+    if (!videoSession.data?.session) throw new Error(`创建群相册视频会话失败: ${videoSession.msg || videoSession.ret}`);
+
+    const uploaded = await this.uploadQunAlbumSlice(path, videoSession.data.session, skey, pskey, uin,
+      this.resolveQunAlbumSliceSize(videoSession.data.slice_size), { appid: 'video_qun', cmd: 'FileUploadVideo' });
+    if (!uploaded.sVid) throw new Error('视频上传完成但未取得 sVid，无法挂进相册');
+
+    // 2) 封面：抽首帧，失败（含 ffmpeg 不可用）回落内置默认封面
+    //    用 .png：Native Addon 路径产出的就是 png（日志里可见 Detected format: png），
+    //    而命令行路径会按扩展名编码，两条路都能得到真正的 PNG
+    const coverPath = join(this.core.NapCatTempPath, `${randomUUID()}.png`);
+    try {
+      try {
+        await FFmpegService.extractThumbnail(path, coverPath);
+      } catch (e) {
+        this.context.logger.logWarn('提取视频封面失败，使用默认封面', e);
+        await writeFile(coverPath, Buffer.from(defaultVideoThumbB64, 'base64'));
+      }
+
+      // 3) 封面二段上传：这一步才带相册和批次号，视频靠它进相册
+      const cover_md5 = await hashFile(coverPath, 'md5');
+      const coverSession = await RequestUtil.HttpGetJson<{
+        data: { session: string; slice_size?: number | string; },
+        ret: number,
+        msg: string;
+      }>(`https://h5.qzone.qq.com/webapp/json/sliceUpload/FileBatchControl/${cover_md5}?g_tk=${GTK}`, 'POST', qunAlbumVideoCoverControl({
+        uin,
+        group_id: gc,
+        pskey,
+        sAlbumName,
+        sAlbumID,
+        cover_md5,
+        cover_size: statSync(coverPath).size,
+        vid: uploaded.sVid,
+      }), {
+        Cookie: cookie,
+        'Content-Type': 'application/json',
+      });
+      if (!coverSession.data?.session) throw new Error(`创建群相册视频封面会话失败: ${coverSession.msg || coverSession.ret}`);
+
+      await this.uploadQunAlbumSlice(coverPath, coverSession.data.session, skey, pskey, uin,
+        this.resolveQunAlbumSliceSize(coverSession.data.slice_size));
+    } finally {
+      if (existsSync(coverPath)) {
+        await unlink(coverPath);
+      }
+    }
+  }
+
+  async getAlbumMediaListByNTQQ (gc: string, albumId: string, attach_info: string = '') {
+    return (await this.context.session.getAlbumService().getMediaList({
+      qun_id: gc,
+      attach_info,
+      seq: 0,
+      request_time_line: {
+        request_invoke_time: '0',
+      },
+      album_id: albumId,
+      lloc: '',
+      batch_id: '',
+    })).response;
+  }
+
+  async doAlbumMediaPlainCommentByNTQQ (
+    qunId: string,
+    albumId: string,
+    lloc: string | undefined,
+    content: string,
+    batchId: string = '') {
+    if (!lloc && !batchId) {
+      throw new Error('lloc 或 batch_id 至少需要提供一个');
+    }
+    const random_seq = Math.floor(Math.random() * 9000) + 1000;
+    const uin = this.core.selfInfo.uin || '10001';
+    const albumService = this.context.session.getAlbumService();
+    let feed;
+    if (lloc) {
+      feed = createAlbumMediaFeed(uin, albumId, lloc, batchId);
+    } else {
+      // Batch comments need the server's feed identity and uploader, not an
+      // empty media cell with the commenter substituted for the feed owner.
+      const { response } = await albumService.getQunFeedDetail({
+        seq: random_seq,
+        request_time_line: { request_invoke_time: '0' },
+        ext_info: { map_info: [], map_bytes_info: [], map_user_account: [] },
+        qun_id: qunId,
+        feed_id: '',
+        comment_count: 20,
+        attach_info: '',
+        album_id: albumId,
+        batch_id: batchId,
+        lloc: '',
+      });
+      if (response?.result !== 0) {
+        throw new Error(`获取群相册批次动态失败, ${response?.result ?? 'unknown'}:${response?.errMs || '未知错误'}`);
+      }
+      feed = response.feed?.feed;
+      if (!feed?.cell_common?.feed_id || !feed.cell_user_info?.user || !feed.cell_media) {
+        throw new Error('获取群相册批次动态失败: 未返回有效动态');
+      }
+    }
+    // 16位number数字
+    const client_key = Date.now() * 1000;
+    const result = await albumService.doQunComment(
+      random_seq, {
+        map_info: [],
+        map_bytes_info: [],
+        map_user_account: [],
+      },
+      qunId,
+      2,
+      feed,
+      createAlbumCommentRequest(uin, content, client_key)
+    );
+    if (result?.result !== 0) {
+      throw new Error(`群相册评论失败, ${result?.result ?? 'unknown'}:${result?.errMs || '未知错误'}`);
+    }
+    if (!result.comment?.id) {
+      throw new Error('群相册评论失败: 未返回有效评论');
+    }
+    return result;
+  }
+
+  async deleteAlbumMediaByNTQQ (
+    qunId: string,
+    albumId: string,
+    lloc: string) {
+    const random_seq = Math.floor(Math.random() * 9000) + 1000;
+    return await this.context.session.getAlbumService().deleteMedias(
+      random_seq,
+      qunId,
+      albumId,
+      [lloc],
+      []
+    );
+  }
+
+  async doAlbumMediaLikeByNTQQ (
+    qunId: string,
+    albumId: string,
+    batchId: string,
+    lloc: string | undefined,
+    isLike: boolean
+  ) {
+    const random_seq = Math.floor(Math.random() * 9000) + 1000;
+    const uin = this.core.selfInfo.uin || '10001';
+
+    const type = isLike ? 2 : 1;
+    const status = isLike ? 0 : 1;
+
+    let id = '';
+    if (lloc) {
+      id = `421_1_0_${qunId}|${albumId}|${batchId}^||^421_1_0_${qunId}|${albumId}|${lloc}^||^0`;
+    } else {
+      id = `421_1_0_${qunId}|${albumId}|${batchId}`;
+    }
+
+    return await this.context.session.getAlbumService().doQunLike(
+      random_seq,
+      {
+        map_info: [],
+        map_bytes_info: [],
+        map_user_account: [],
+      },
+      type,
+      {
+        id,
+        status,
+      },
+      createAlbumFeedPublish(qunId, uin, albumId, batchId)
+    );
+  }
+
+  private async getQzoneAuth () {
+    const uin = this.core.selfInfo.uin;
+    const uid = this.core.selfInfo.uid;
+    if (!uin || !uid) throw new Error('QQ空间需要已登录的当前账号');
+    const assertAccount = () => {
+      if (this.core.selfInfo.uin !== uin || this.core.selfInfo.uid !== uid) throw new Error('QQ账号已切换，请重新确认QQ空间操作');
+    };
+    const skey = await this.core.apis.UserApi.getSKey() || '';
+    assertAccount();
+    const pskey = (await this.core.apis.UserApi.getPSkey(['qzone.qq.com'])).domainPskeyMap.get('qzone.qq.com') || '';
+    assertAccount();
+    const g_tk = this.getBknFromSKey(skey);
+    const cookie = `p_uin=o${uin}; p_skey=${pskey}; skey=${skey}; uin=o${uin}`;
+    return { skey, pskey, uin, g_tk, cookie };
+  }
+
+  /**
+   * 上传图片到 QQ 空间相册, 返回可用于发说说的 richval 字符串
+   * @param base64 图片Base64编码内容(不带data:前缀)
+   */
+  async uploadImageToQzone (base64: string): Promise<string> {
+    const { skey, pskey, uin, g_tk, cookie } = await this.getQzoneAuth();
+    const body = buildQzoneUploadImageBody({ uin, skey, pskey, g_tk, base64 });
+    const api = `https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image?g_tk=${g_tk}`;
+    const resultText = await RequestUtil.HttpGetText(api, 'POST', body, {
+      Cookie: cookie,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    });
+    const parsed = parseQzoneUploadImageResponseText(resultText);
+    if (parsed.code !== undefined && parsed.code !== 0) {
+      throw new Error(parsed.msg || `QQ空间图片上传失败, code=${parsed.code}`);
+    }
+    if (!parsed.data) {
+      throw new Error('QQ空间图片上传失败, 响应缺少data字段');
+    }
+    return toQzoneRichval(parsed.data);
+  }
+
+  /**
+   * 发表QQ空间说说
+   * @param content 说说正文
+   * @param richvals 每张图片对应的richval数组, 为空表示纯文字说说
+   * @param ugcRight 查看权限 1所有人可见 4好友可见 16部分好友可见 64仅自己可见 128部分好友不可见
+   * @param targetUins 权限作用QQ号数组, ugcRight为16/128时使用
+   */
+  async publishQzoneMsg (content: string, richvals: string[], ugcRight: number, targetUins?: Array<string | number>) {
+    const { uin, g_tk, cookie } = await this.getQzoneAuth();
+    const richval = richvals.length > 0 ? richvals.join('\t') : undefined;
+    const allowUins = targetUins && targetUins.length > 0 ? targetUins.join('|') : undefined;
+    const body = buildQzonePublishBody({
+      hostuin: uin,
+      content,
+      richval,
+      ugcRight,
+      allowUins,
+    });
+    const api = `https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6?g_tk=${g_tk}`;
+    const result = await RequestUtil.HttpGetJson<QzonePublishResponse>(api, 'POST', body, {
+      Cookie: cookie,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    }, true, false);
+    return parseQzonePublishResponse(result);
+  }
+
+  /**
+   * 删除QQ空间说说
+   * @param tid 说说Tid, 来自 publishQzoneMsg 的返回值
+   */
+  async deleteQzoneMsg (tid: string) {
+    const { uin, g_tk, cookie } = await this.getQzoneAuth();
+    const body = buildQzoneDeleteBody({ hostuin: uin, tid });
+    const api = `https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6?g_tk=${g_tk}`;
+    const result = await RequestUtil.HttpGetJson<QzoneDeleteResponse>(api, 'POST', body, {
+      Cookie: cookie,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    }, true, false);
+    return parseQzoneDeleteResponse(result);
+  }
+
+  async getDaySignedList (groupCode: string) {
+    const pSkey = (await this.core.apis.UserApi.getPSkey(['qun.qq.com'])).domainPskeyMap.get('qun.qq.com')!;
+    const selfUin = this.core.selfInfo.uin;
+    const cookie = `p_uin=o${selfUin}; p_skey=${pSkey}; uin=o${selfUin}`;
+    const post = await RequestUtil.HttpGetJson<{
+      retCode: number,
+      costTime: number,
+      response: {
+        ret?: {
+          code: string,
+          msg: string,
+        },
+        page?: {
+          infos?: {
+            uid: string,
+            uidGroupNick: string,
+            signedTimeStamp: string,
+            signInRank: number,
+          }[],
+          offset: number,
+          total: number,
+        }[],
+      },
+      funcCode: number,
+    }>(`https://qun.qq.com/v2/signin/trpc/GetDaySignedList?g_tk=${this.getBknFromPSKey(pSkey)}`, 'POST', {
+      dayYmd: new Date().toISOString().slice(0, 10).replace(/-/g, ''),
+      offset: 0,
+      limit: 100,
+      uid: selfUin,
+      groupId: groupCode,
+    }, {
+      Cookie: cookie,
+      'Content-Type': 'application/json',
+    });
+    return post;
+  }
+}

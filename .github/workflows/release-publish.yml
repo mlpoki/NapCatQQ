@@ -1,0 +1,341 @@
+name: Release Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g., v4.10.7)'
+        required: true
+        type: string
+
+permissions: write-all
+
+env:
+  RELEASE_NAME: "NapCat"
+
+jobs:
+  build:
+    name: Build NapCat.${{ matrix.target.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - name: Framework
+            build_cmd: build:framework
+            src_dir: packages/napcat-framework/dist
+            dist_dir: framework-dist
+          - name: Shell
+            build_cmd: build:shell
+            src_dir: packages/napcat-shell/dist
+            dist_dir: shell-dist
+    steps:
+      - name: Clone Main Repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.version }}
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+      - name: Use Node.js 20.x
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20.x
+      - name: Build NapCat.${{ matrix.target.name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NAPCAT_VERSION: ${{ inputs.version }}
+        run: |
+          pnpm i
+          pnpm --filter napcat-webui-frontend run build || exit 1
+          pnpm run ${{ matrix.target.build_cmd }}
+          pnpm --filter napcat-plugin-builtin run build || exit 1
+          mv ${{ matrix.target.src_dir }} ${{ matrix.target.dist_dir }}
+          cd ${{ matrix.target.dist_dir }}
+          # --omit=dev still resolves dev peer dependencies; remove build tooling first.
+          npm pkg delete devDependencies
+          npm install --omit=dev
+          rm ./package-lock.json || exit 0
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: NapCat.${{ matrix.target.name }}
+          path: ${{ matrix.target.dist_dir }}
+
+  assemble-windows-node:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      # QQ 9.9.31.49738; SHA256 matches the microsoft/winget-pkgs installer manifest.
+      QQ_URL: https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260528-3e8913a2/QQ_9.9.31_260528_x64_01.exe
+      QQ_SHA256: 0beb5cb4ff776cba822caa0abadbd53f5892f12628a86dabea1b372c82c086bc
+      NODE_VERSION: '22.11.0'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.version }}
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: ./artifacts
+
+      - name: Setup tools
+        run: |
+          sudo apt update
+          sudo apt install -y aria2 unzip zip p7zip-full curl jq
+
+      - name: Generate download cache key
+        id: download-cache-key
+        run: |
+          DOWNLOAD_HASH=$(printf '%s\n' "$QQ_URL" "$QQ_SHA256" "$NODE_VERSION" | sha256sum | cut -d ' ' -f 1)
+          echo "key=napcat-downloads-v2-$DOWNLOAD_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Cache QQ and Node.js downloads
+        id: cache-downloads
+        uses: actions/cache@v4
+        with:
+          path: /tmp/napcat-downloads
+          key: ${{ steps.download-cache-key.outputs.key }}
+
+      - name: Download QQ and Node.js
+        if: steps.cache-downloads.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/napcat-downloads
+          cd /tmp/napcat-downloads
+
+          echo "Downloading QQ installer..."
+          # Retry download errors, including HTTP 404 responses.
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 30 --max-time 600 --user-agent "Mozilla/5.0" \
+            --output "QQ_x64.exe" "$QQ_URL"
+
+          NODE_URL="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-win-x64.zip"
+          echo "Downloading Node.js $NODE_VERSION..."
+          aria2c -x1 -s1 -k1M -o "node-win-x64.zip" "$NODE_URL"
+
+      - name: Verify QQ installer
+        run: |
+          echo "$QQ_SHA256  /tmp/napcat-downloads/QQ_x64.exe" | sha256sum --check --strict -
+
+      - name: Assemble NapCat.Shell.Windows.Node.zip
+        run: |
+          set -euo pipefail
+          TMPDIR=$(mktemp -d)
+          CACHE_DIR="/tmp/napcat-downloads"
+
+          # -----------------------------
+          # 1) 解压 QQ x64
+          # -----------------------------
+          QQ_EXTRACT="$TMPDIR/qq_extracted"
+          mkdir -p "$QQ_EXTRACT"
+          7z x -y -o"$QQ_EXTRACT" "$CACHE_DIR/QQ_x64.exe" >/dev/null
+
+          # -----------------------------
+          # 2) 解压 Node.js Windows x64
+          # -----------------------------
+          NODE_EXTRACT="$TMPDIR/node_extracted"
+          mkdir -p "$NODE_EXTRACT"
+          unzip -q "$CACHE_DIR/node-win-x64.zip" -d "$NODE_EXTRACT"
+
+          # -----------------------------
+          # 3) 创建输出目录
+          # -----------------------------
+          OUT_DIR="$GITHUB_WORKSPACE/NapCat.Shell.Windows.Node"
+          mkdir -p "$OUT_DIR/NapCat.Shell.Windows.Node"
+
+          # -----------------------------
+          # 4) 解压 NapCat.Shell.zip 到 napcat
+          # -----------------------------
+          cp -a "$GITHUB_WORKSPACE/artifacts/NapCat.Shell/." "$OUT_DIR/napcat/"
+
+          # -----------------------------
+          # 5) 拷贝 QQ 文件到 NapCat.Shell.Windows.Node
+          # -----------------------------
+          QQ_TARGETS=("avif_convert.dll" "broadcast_ipc.dll" "config.json" "crypto.dll" "ssl.dll" "libglib-2.0-0.dll" "libgobject-2.0-0.dll" "libvips-42.dll" "ncnn.dll" "opencv.dll" "package.json" "QBar.dll" "wrapper.node" "LightQuic.dll")
+          for name in "${QQ_TARGETS[@]}"; do
+            source_file=$(find "$QQ_EXTRACT" -type f -iname "$name" -print -quit)
+            if [ -z "$source_file" ]; then
+              echo "Missing required QQ file: $name" >&2
+              exit 1
+            fi
+            cp -a "$source_file" "$OUT_DIR/"
+          done
+
+          # -----------------------------
+          # 5.1) 拷贝 win64 目录下的文件
+          # -----------------------------
+          mkdir -p "$OUT_DIR/win64"
+          find "$QQ_EXTRACT" -ipath "*/win64/SSOShareInfoHelper64.dll" -exec cp -a {} "$OUT_DIR/win64/" \; || true
+          find "$QQ_EXTRACT" -ipath "*/win64/parent-ipc-core-x64.dll" -exec cp -a {} "$OUT_DIR/win64/" \; || true
+
+          # -----------------------------
+          # 6) 拷贝仓库文件 napcat.bat 和 index.js
+          # -----------------------------
+          cp -a "$GITHUB_WORKSPACE/packages/napcat-develop/napcat.bat" "$OUT_DIR/" || true
+          cp -a "$GITHUB_WORKSPACE/packages/napcat-develop/index.js" "$OUT_DIR/" || true
+          cp -a "$GITHUB_WORKSPACE/packages/napcat-develop/QQNT.dll" "$OUT_DIR/" || true
+
+          # -----------------------------
+          # 7) 拷贝 Node.exe 到 NapCat.Shell.Windows.Node
+          # -----------------------------
+          cp -a "$NODE_EXTRACT/node-v$NODE_VERSION-win-x64/node.exe" "$OUT_DIR/" || true
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: NapCat.Shell.Windows.Node
+          path: NapCat.Shell.Windows.Node
+
+  validate-windows-node:
+    needs: assemble-windows-node
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.version }}
+      - uses: actions/download-artifact@v7
+        with:
+          name: NapCat.Shell.Windows.Node
+          path: windows-node
+
+      - name: Verify bundled Node and QQ native dependencies
+        shell: pwsh
+        working-directory: windows-node
+        run: |
+          & .\node.exe --check .\index.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\node.exe -e "const wrapper = require('./wrapper.node'); if (!wrapper.NodeQQNTWrapperUtil) throw new Error('Missing NodeQQNTWrapperUtil'); console.log('wrapper.node native-load PASS'); process.exit(0);"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify Windows loader file queries
+        shell: pwsh
+        run: |
+          cmake -S .github/tests/windows-loader -B "$env:RUNNER_TEMP/windows-loader-test" -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build "$env:RUNNER_TEMP/windows-loader-test" --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:RUNNER_TEMP/windows-loader-test/Release/windows-loader-test.exe" "$pwd/windows-node/napcat/NapCatWinBootHook.dll" "$pwd/windows-node/napcat/loadNapCat.js"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  release-napcat:
+    needs: [build, assemble-windows-node, validate-windows-node]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: ./artifacts
+
+      - name: Download NapCat.Shell.Windows.OneKey.zip
+        run: |
+            curl -L -o NapCat.Shell.Windows.OneKey.zip https://github.com/NapNeko/NapCatResource/raw/main/NapCat.Shell.Windows.OneKey.zip
+
+      - name: Zip Artifacts
+        run: |
+            cd artifacts
+            [ -d NapCat.Framework ] && (cd NapCat.Framework && zip -qr ../../NapCat.Framework.zip .)
+            [ -d NapCat.Shell ] && (cd NapCat.Shell && zip -qr ../../NapCat.Shell.zip .)
+            [ -d NapCat.Shell.Windows.Node ] && (cd NapCat.Shell.Windows.Node && zip -qr ../../NapCat.Shell.Windows.Node.zip .)
+            cd ..
+
+      - name: Use Node.js 20.x
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20.x
+
+      - name: Generate release note
+        env:
+          CURRENT_TAG: ${{ inputs.version }}
+        run: node .github/scripts/generate-release-notes.mjs "$CURRENT_TAG" "$GITHUB_REPOSITORY" CHANGELOG.md
+
+      - name: Create Release and Upload Artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: NapCat ${{ inputs.version }}
+          body_path: CHANGELOG.md
+          files: |
+            NapCat.Shell.Windows.Node.zip
+            NapCat.Framework.zip
+            NapCat.Shell.zip
+            NapCat.Shell.Windows.OneKey.zip
+          draft: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Update apifox
+        env:
+          APIFOX_TOKEN: ${{ secrets.APIFOX_TOKEN }}
+        run: |
+          pnpm i --ignore-scripts
+          pnpm run build:openapi
+
+          jq -n --rawfile input packages/napcat-schema/dist/openapi.json \
+          '{
+              input: $input,
+              options: {
+                  "endpointOverwriteBehavior": "OVERWRITE_EXISTING",
+                  "schemaOverwriteBehavior": "OVERWRITE_EXISTING",
+                  "updateFolderOfChangedEndpoint": true,
+                  "moduleId": 1140714,
+                  "deleteUnmatchedResources": true
+              }
+          }' > apifox_payload.json
+
+          curl --location -g --request POST 'https://api.apifox.com/v1/projects/5348325/import-openapi?locale=zh-CN' \
+          --header 'X-Apifox-Api-Version: 2024-03-28' \
+          --header "Authorization: Bearer $APIFOX_TOKEN" \
+          --header 'Content-Type: application/json' \
+          --data-binary @apifox_payload.json
+
+      - name: Publish release hash
+        env:
+          GH_TOKEN: ${{ secrets.NAPCAT_BUILD }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          HASH_REPO="NapNeko/napcat-release-hash"
+
+          gh auth setup-git
+          gh repo clone "$HASH_REPO" hash-repo
+
+          node .github/scripts/publish-release-hash.mjs \
+            --version    "$VERSION" \
+            --shell      "./artifacts/NapCat.Shell/napcat.mjs" \
+            --framework  "./artifacts/NapCat.Framework/napcat.mjs" \
+            --file       "./hash-repo/release.json"
+
+          cd hash-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add release.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: update release hash for ${VERSION}"
+            git push origin HEAD:main || git push origin HEAD:master
+          fi
+
+      - name: Trigger downstream release workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "Triggering release-downstream workflow with tag_name=${VERSION}"
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/release-downstream.yml/dispatches \
+            -d "{\"ref\":\"main\",\"inputs\":{\"tag_name\":\"${VERSION}\"}}"
