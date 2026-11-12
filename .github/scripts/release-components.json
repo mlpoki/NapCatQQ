@@ -1,0 +1,10 @@
+{
+  "qce_repository": "shuakami/qq-chat-exporter",
+  "qce_sha": "4317f8c69b30c60bae47b543817b227665fa4f30",
+  "qce_version": "6.4.3",
+  "quick_pack_sha256": "753b2cf967c4ac310aa9abf47b287c1b543f871601d44dd83ac068a293086bdb",
+  "framework_pack_sha256": "e2cea26b4ea6ac1ab2a56b4d70743054d1a9b3025b562952212aba8506ab76c5",
+  "qq_url": "https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260528-3e8913a2/QQ_9.9.31_260528_x64_01.exe",
+  "qq_sha256": "0beb5cb4ff776cba822caa0abadbd53f5892f12628a86dabea1b372c82c086bc",
+  "node_version": "22.11.0"
+}
