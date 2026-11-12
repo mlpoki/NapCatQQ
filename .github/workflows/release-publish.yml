@@ -65,8 +65,6 @@ jobs:
             runner: windows-latest
           - platform: Linux-x64
             runner: ubuntu-latest
-          - platform: macOS-arm64
-            runner: macos-15
     defaults:
       run:
         shell: bash
@@ -88,7 +86,6 @@ jobs:
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           echo "source_branch=main source_sha=$SOURCE_SHA release_tag=$NAPCAT_VERSION workflow_sha=$GITHUB_WORKFLOW_SHA"
           uname -a
-          if [ "$RUNNER_OS" = macOS ]; then test "$(uname -m)" = arm64; fi
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -115,10 +112,6 @@ jobs:
             echo '{"napcat-plugin-builtin":true}' > "packages/napcat-$kind/dist/config/plugins.json"
             (cd "packages/napcat-$kind/dist" && npm pkg delete devDependencies && npm install --omit=dev)
           done
-      - name: Sign packaged macOS native modules ad-hoc on arm64
-        if: runner.os == 'macOS'
-        run: |
-          find packages/napcat-shell/dist/native packages/napcat-framework/dist/native -name '*darwin.arm64.node' -exec codesign --force --sign - {} \;
       # The pinned QCE tree contains an unconfigured .napcat-src gitlink.
       # Plain Git avoids checkout action's recursive credential cleanup; that
       # nested NapCat source is not used by QCE's release runtime packer.
@@ -153,7 +146,6 @@ jobs:
           else
             cargo build --locked --release
           fi
-          if [ "$RUNNER_OS" = macOS ]; then codesign --force --sign - target/release/qce-server; fi
       - uses: pnpm/action-setup@v4
         with:
           version: 8

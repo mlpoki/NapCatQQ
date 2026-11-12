@@ -4,7 +4,6 @@ const path = require('node:path');
 const assets = [
   'NapCat.Shell.Windows.OneKey.zip', 'NapCat-QCE-Windows-x64.zip',
   'NapCat-Framework-QCE.zip', 'NapCat-QCE-Linux-x64.tar.gz',
-  'NapCat-QCE-macOS-arm64.tar.gz',
 ];
 async function optional(request) {
   try { return (await request()).data; } catch (e) {
