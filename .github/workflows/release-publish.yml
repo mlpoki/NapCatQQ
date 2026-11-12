@@ -74,6 +74,8 @@ jobs:
       SOURCE_SHA: ${{ needs.resolve-main.outputs.source_sha }}
       NAPCAT_VERSION: ${{ needs.resolve-main.outputs.release_tag }}
       QCE_VERSION: 6.4.3
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
       NODE_OPTIONS: --max-old-space-size=4096
       NEXT_TELEMETRY_DISABLED: '1'
     steps:
@@ -90,6 +92,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Verify Python UTF-8 packaging output
+        run: python -c "import sys; assert sys.flags.utf8_mode == 1; assert sys.stdout.encoding.lower().replace('-', '') == 'utf8'; print('Framework 模式优势：UTF-8 PASS')"
       - uses: pnpm/action-setup@v4
         with:
           version: 9
