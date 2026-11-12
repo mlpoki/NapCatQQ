@@ -115,14 +115,15 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           find packages/napcat-shell/dist/native packages/napcat-framework/dist/native -name '*darwin.arm64.node' -exec codesign --force --sign - {} \;
-      - uses: actions/checkout@v5
-        with:
-          repository: shuakami/qq-chat-exporter
-          ref: 4317f8c69b30c60bae47b543817b227665fa4f30
-          path: qce
-          persist-credentials: false
-      - name: Verify pinned dependency source
+      # The pinned QCE tree contains an unconfigured .napcat-src gitlink.
+      # Plain Git avoids checkout action's recursive credential cleanup; that
+      # nested NapCat source is not used by QCE's release runtime packer.
+      - name: Checkout and verify pinned QCE dependency without submodules
         run: |
+          git init qce
+          git -C qce remote add origin https://github.com/shuakami/qq-chat-exporter.git
+          git -C qce fetch --depth=1 origin 4317f8c69b30c60bae47b543817b227665fa4f30
+          git -C qce checkout --detach FETCH_HEAD
           test "$(git -C qce rev-parse HEAD)" = 4317f8c69b30c60bae47b543817b227665fa4f30
       - uses: dtolnay/rust-toolchain@stable
       - name: Linux static Rust toolchain
@@ -141,6 +142,8 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
+          rustc --version
+          cargo --version
           if [ "$RUNNER_OS" = Linux ]; then
             cargo build --locked --release --target x86_64-unknown-linux-musl
           else
