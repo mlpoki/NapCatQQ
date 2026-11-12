@@ -62,11 +62,13 @@ async function publish({ github, context, core }) {
   if (release && (release.draft || release.prerelease || release.immutable)) throw new Error('Release cannot be modified');
   const start = '<!-- fork-release:start -->';
   const end = '<!-- fork-release:end -->';
-  const report = `${start}\nsource_branch=main\nsource_sha=${sha}\nworkflow_sha=${process.env.GITHUB_WORKFLOW_SHA}\nrelease_tag=${tag}\nQCE=v6.4.3 (4317f8c69b30c60bae47b543817b227665fa4f30)\nBuild: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n${assets.map(n => `- ${n}`).join('\n')}\n\nQQ login, live chat export and desktop interaction: pending manual verification.\n${end}`;
-  const previous = release?.body || '';
+  const report = `${start}\n<details>\n<summary>构建来源</summary>\n\nsource_branch=main\nsource_sha=${sha}\nworkflow_sha=${process.env.GITHUB_WORKFLOW_SHA}\nrelease_tag=${tag}\nQCE=v6.4.3 (4317f8c69b30c60bae47b543817b227665fa4f30)\nBuild: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n${assets.map(n => `- ${n}`).join('\n')}\n\n</details>\n${end}`;
+  const notesPath = path.join(__dirname, '../release-notes', `${tag}.md`);
+  const approvedNotes = fs.existsSync(notesPath) ? fs.readFileSync(notesPath, 'utf8').trim() : '';
+  const previous = release?.body || approvedNotes;
   const first = previous.indexOf(start), last = previous.indexOf(end);
   const body = first >= 0 && last >= first ? previous.slice(0, first) + report + previous.slice(last + end.length) : `${previous}\n\n${report}`.trim();
-  if (!release) release = (await github.rest.repos.createRelease({ ...repo, tag_name: tag, target_commitish: sha, name: `NapCat ${tag}`, body, draft: false, prerelease: false })).data;
+  if (!release) release = (await github.rest.repos.createRelease({ ...repo, tag_name: tag, target_commitish: sha, name: `NapCat + QCE ${tag}`, body, draft: false, prerelease: false })).data;
   else await github.rest.repos.updateRelease({ ...repo, release_id: release.id, body });
   const existing = await github.paginate(github.rest.repos.listReleaseAssets, { ...repo, release_id: release.id, per_page: 100 });
   for (const name of assets) {
