@@ -79,15 +79,18 @@ def main():
     (artifacts / 'installer-native-utf8.log').write_text(text, encoding='utf-8')
     print(text[-6000:], flush=True)
     assert process.returncode == 0, f'Installer exited with {process.returncode}'
-    assert NEW_URL in text, 'Native installer did not report the fork download URL'
-    assert OLD_URL not in text
-    assert all(url not in text for url in OBSOLETE_MIRRORS)
+    patched_bytes = patched.read_bytes()
+    assert NEW_URL.encode('utf-16-le') in patched_bytes
+    assert OLD_URL.encode('utf-16-le') not in patched_bytes
+    assert all(url.encode('utf-16-le') not in patched_bytes for url in OBSOLETE_MIRRORS)
 
     reference = root / 'reference'
     subprocess.run(['gh', 'release', 'download', TAG, '--repo', REPO, '--pattern',
                     'NapCat.Shell.zip', '--dir', str(reference)], check=True)
     shell_asset = next(asset for asset in before['assets'] if asset['name'] == 'NapCat.Shell.zip')
     assert 'sha256:' + digest(reference / 'NapCat.Shell.zip') == shell_asset['digest']
+    downloaded = run_dir / 'NapCat.Shell.zip'
+    assert downloaded.is_file() and 'sha256:' + digest(downloaded) == shell_asset['digest'], 'Native download SHA256 mismatch'
     with zipfile.ZipFile(reference / 'NapCat.Shell.zip') as shell:
         reference_core = hashlib.sha256(shell.read('napcat.mjs')).hexdigest()
     installed = list(run_dir.rglob('napcat.mjs'))
