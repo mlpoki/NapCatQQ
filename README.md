@@ -1,4 +1,4 @@
-<img src="https://napneko.github.io/assets/newnewlogo.png" width = "305" height = "411" alt="NapCat" align=right />
+<img src="[https://github.com/mlpoki/NapCatQQ/blob/323410242c1e7be4a74bf5514189e2c81ddc661d/logo.png](https://github.com/mlpoki/NapCatQQ/blob/323410242c1e7be4a74bf5514189e2c81ddc661d/logo.png)" width = "305" height = "411" alt="NapCat" align=right />
 <div align="center">
 
 # NapCat
